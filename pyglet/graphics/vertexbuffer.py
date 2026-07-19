@@ -25,6 +25,9 @@ from pyglet.gl.gl import (
     GL_MAP_WRITE_BIT,
     GL_MAP_COHERENT_BIT,
     GL_MAP_PERSISTENT_BIT,
+    GL_SYNC_FLUSH_COMMANDS_BIT,
+    GL_SYNC_GPU_COMMANDS_COMPLETE,
+    GL_TIMEOUT_EXPIRED,
     GL_WRITE_ONLY,
     GLubyte,
     GLuint,
@@ -32,7 +35,10 @@ from pyglet.gl.gl import (
     glBufferData,
     glBufferStorage,
     glBufferSubData,
+    glClientWaitSync,
     glDeleteBuffers,
+    glDeleteSync,
+    glFenceSync,
     glGenBuffers,
     glMapBuffer,
     glMapBufferRange,
@@ -45,7 +51,6 @@ if TYPE_CHECKING:
 
 CTypesDataType = Type[_SimpleCData]
 CTypesPointer = _Pointer
-
 
 class AbstractBuffer:
     """Abstract buffer of byte data.
@@ -222,6 +227,15 @@ class BackedBufferObject(BufferObject):
     in system memory until ``commit`` is called.  The advantage is that fewer
     OpenGL calls are needed, which can increase performance at the expense of
     system memory.
+
+    Dirty state is tracked as a min/max byte span PLUS a bounded set of the
+    exact regions written since the last commit. With many objects sharing
+    one large buffer (e.g. thousands of sprites in a batch), two small writes
+    at opposite ends of the buffer previously forced an upload of nearly the
+    entire buffer every frame. When only a few regions were written, commit
+    now uploads just those regions; busy buffers (more than ``_max_spans``
+    distinct regions) gracefully fall back to the single-span upload, so the
+    write path stays as cheap as before under heavy load.
     """
     data: CTypesDataType
     data_ptr: int
@@ -231,6 +245,16 @@ class BackedBufferObject(BufferObject):
     stride: int
     count: int
     ctype: CTypesDataType
+
+    # Track up to this many distinct written regions per commit cycle.
+    # Beyond this, fall back to a single min..max span upload.
+    _max_spans: int = 64
+    # Merge recorded regions separated by less than this many bytes, so
+    # commit issues a handful of medium uploads instead of many tiny ones.
+    _merge_gap: int = 2048
+    # More merged runs than this -> single span upload (protects against
+    # pathological scatter producing too many GL calls).
+    _max_uploads: int = 32
 
     def __init__(self, size: int, c_type: CTypesDataType, stride: int, count: int,  # noqa: D107
                  usage: int = GL_DYNAMIC_DRAW) -> None:
@@ -245,6 +269,7 @@ class BackedBufferObject(BufferObject):
         self._dirty_min = sys.maxsize
         self._dirty_max = 0
         self._dirty = False
+        self._dirty_spans = set()  # None means overflowed: use min..max span
 
         self.stride = stride
         self.count = count
@@ -252,22 +277,60 @@ class BackedBufferObject(BufferObject):
     def commit(self) -> None:
         """Commits all saved changes to the underlying buffer before drawing.
 
-        Allows submitting multiple changes at once, rather than having to call glBufferSubData for every change.
+        Allows submitting multiple changes at once, rather than having to call
+        glBufferSubData for every change. When few distinct regions were
+        written, only those regions are uploaded.
         """
         if not self._dirty:
             return
 
         glBindBuffer(GL_ARRAY_BUFFER, self.id)
-        size = self._dirty_max - self._dirty_min
+        dirty_min = self._dirty_min
+        size = self._dirty_max - dirty_min
         if size > 0:
-            if size == self.size:
+            spans = self._dirty_spans
+            runs = None
+            if spans is not None and len(spans) > 1:
+                # merge the recorded regions into contiguous upload runs
+                merge_gap = self._merge_gap
+                runs = []
+                run_start = run_end = None
+                for span_start, span_end in sorted(spans):
+                    if run_end is None:
+                        run_start, run_end = span_start, span_end
+                    elif span_start - run_end <= merge_gap:
+                        if span_end > run_end:
+                            run_end = span_end
+                    else:
+                        runs.append((run_start, run_end))
+                        run_start, run_end = span_start, span_end
+                runs.append((run_start, run_end))
+                if len(runs) > self._max_uploads:
+                    runs = None
+                else:
+                    # if the runs cover most of the buffer anyway, prefer the
+                    # single envelope upload (and its glBufferData orphan path)
+                    # over multiple glBufferSubData calls into a buffer the GPU
+                    # may still be reading from
+                    total_bytes = 0
+                    for run_start, run_end in runs:
+                        total_bytes += run_end - run_start
+                    if total_bytes * 2 >= self.size:
+                        runs = None
+
+            if runs is not None and len(runs) > 1:
+                data_ptr = self.data_ptr
+                for run_start, run_end in runs:
+                    glBufferSubData(GL_ARRAY_BUFFER, run_start, run_end - run_start, data_ptr + run_start)
+            elif size == self.size:
                 glBufferData(GL_ARRAY_BUFFER, self.size, self.data, self.usage)
             else:
-                glBufferSubData(GL_ARRAY_BUFFER, self._dirty_min, size, self.data_ptr + self._dirty_min)
+                glBufferSubData(GL_ARRAY_BUFFER, dirty_min, size, self.data_ptr + dirty_min)
 
             self._dirty_min = sys.maxsize
             self._dirty_max = 0
             self._dirty = False
+            self._dirty_spans = set()
 
     @lru_cache(maxsize=None)  # noqa: B019
     def get_region(self, start: int, count: int) -> Array[CTypesDataType]:
@@ -277,6 +340,8 @@ class BackedBufferObject(BufferObject):
         return ctypes.cast(self.data_ptr + byte_start, ptr_type).contents
 
     def set_region(self, start: int, count: int, data: Sequence[float]) -> None:
+        if count <= 0:
+            return
         array_start = self.count * start
         array_end = self.count * count + array_start
 
@@ -291,6 +356,12 @@ class BackedBufferObject(BufferObject):
         if byte_end > self._dirty_max:
             self._dirty_max = byte_end
         self._dirty = True
+        spans = self._dirty_spans
+        if spans is not None:
+            if len(spans) < self._max_spans:
+                spans.add((byte_start, byte_end))
+            else:
+                self._dirty_spans = None  # overflowed: min..max span upload
 
     def resize(self, size: int) -> None:
         # size is the allocator size * attribute.stride
@@ -305,14 +376,21 @@ class BackedBufferObject(BufferObject):
         self._dirty_min = 0
         self._dirty_max = self.size
         self._dirty = True
+        self._dirty_spans = None
 
         self.get_region.cache_clear()
 
     def invalidate(self) -> None:
         super().invalidate()
+        # buffer storage was orphaned: everything must be re-uploaded
+        self._dirty_min = 0
+        self._dirty_max = self.size
         self._dirty = True
+        self._dirty_spans = None
 
     def invalidate_region(self, start: int, count: int) -> None:
+        if count <= 0:
+            return
         byte_start = self.stride * start
         byte_end = byte_start + self.stride * count
         # As of Python 3.11, this is faster than min/max:
@@ -321,6 +399,12 @@ class BackedBufferObject(BufferObject):
         if byte_end > self._dirty_max:
             self._dirty_max = byte_end
         self._dirty = True
+        spans = self._dirty_spans
+        if spans is not None:
+            if len(spans) < self._max_spans:
+                spans.add((byte_start, byte_end))
+            else:
+                self._dirty_spans = None  # overflowed: min..max span upload
 
 
 class AttributeBufferObject(BackedBufferObject):
@@ -339,42 +423,116 @@ class IndexedBufferObject(BackedBufferObject):
         super().__init__(size, c_type, stride, count, usage)
 
 
-class PersistentBufferObject(AbstractBuffer):
-    """A persistently mapped buffer.
+class DrawFence:
+    """A GL fence guarding persistently mapped buffers against in-flight draws.
 
-    Available in OpenGL 4.3+ contexts. Persistently mapped buffers
-    are mapped one time on creation, and can be updated at any time
-    without the need to map or unmap.
+    A vertex domain using persistently mapped buffers arms this fence right
+    after issuing its draw commands. The first CPU write to any of the
+    domain's buffers afterwards waits for the fence, guaranteeing the GPU has
+    finished reading the mapped memory before it is modified. The wait is a
+    no-op in the common case (the previous frame has long finished by the
+    time the next update writes).
     """
 
+    __slots__ = ('sync',)
+
+    # wait in 16.7ms slices, give up (and proceed) after ~1 second
+    _WAIT_SLICE_NS = 16_666_666
+    _MAX_WAIT_SLICES = 60
+
+    def __init__(self) -> None:
+        self.sync = None
+
+    def arm(self) -> None:
+        """Insert a fence after the draw commands just issued."""
+        if self.sync is not None:
+            glDeleteSync(self.sync)
+        self.sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+
+    def wait(self) -> None:
+        """Block until the armed fence has signaled, then clear it."""
+        sync = self.sync
+        if sync is None:
+            return
+        self.sync = None
+        try:
+            # first wait flushes the command stream so the fence is
+            # guaranteed to eventually signal
+            result = glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0)
+            slices = self._MAX_WAIT_SLICES
+            while result == GL_TIMEOUT_EXPIRED and slices > 0:
+                result = glClientWaitSync(sync, 0, self._WAIT_SLICE_NS)
+                slices -= 1
+            # GL_ALREADY_SIGNALED / GL_CONDITION_SATISFIED: done.
+            # GL_WAIT_FAILED or timeout cap: proceed rather than hang; worst
+            # case is a one-frame visual artifact on a wedged driver.
+        finally:
+            glDeleteSync(sync)
+
+
+class PersistentBufferObject(AbstractBuffer):
+    """A persistently mapped OpenGL buffer.
+
+    Requires an OpenGL 4.4+ context, or ``GL_ARB_buffer_storage``.
+    The buffer is mapped once at creation and stays mapped for its whole
+    lifetime: reads and writes go directly to GPU-visible memory, so no
+    commit/upload step is needed before drawing. The coherent mapping makes
+    CPU writes automatically visible to subsequent GL commands.
+
+    Read/write hazards against draws already issued but not yet executed
+    are handled cooperatively with the owning vertex domain through the
+    :py:class:`DrawFence` assigned to :py:attr:`fence`.
+
+    .. warning:: Attribute regions view driver-owned mapped memory. Do not
+        retain a region object (e.g. ``region = vlist.position``) across a
+        buffer resize (any vertex list creation can grow the buffer) or
+        deletion: the old mapping is unmapped and the retained view becomes
+        invalid. Re-access the attribute property each time instead, as all
+        of pyglet's own modules do.
+    """
+
+    #: Assigned by the owning vertex domain: a DrawFence shared by all the
+    #: domain's buffers. May be None (no synchronization).
+    fence: DrawFence | None = None
+
     def __init__(self, size, attribute, vao):
-        # TODO: Persistent buffers cannot be resized. A new buffer is created, and the
-        #       data is copied over. Therefore, unlike other buffers, they currently
-        #       require s reference to an attribute so the attribute pointer can be reset
-        #       on resize calls. This can be reevaluated for a better solution.
+        # NOTE: Persistent buffers cannot be resized in place. On resize, a
+        #       new buffer is created and the data copied over, so a
+        #       reference to the attribute (and VAO) is required to re-point
+        #       the attribute at the new buffer.
 
         self.size = size
         self.attribute = attribute
-        self.attribute_stride = attribute.stride
-        self.attribute_count = attribute.count
-        self.attribute_ctype = attribute.c_type
+        self.stride = attribute.stride
+        self.count = attribute.count
+        self.c_type = attribute.c_type
         self.vao = vao
 
         self._context = pyglet.gl.current_context
+
+        # GL_MAP_READ_BIT keeps reads through the mapping defined behavior:
+        # resize, VertexList.migrate and user code all read attribute regions.
+        self.flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT
 
         buffer_id = GLuint()
         glGenBuffers(1, buffer_id)
         self.id = buffer_id.value
         glBindBuffer(GL_ARRAY_BUFFER, self.id)
 
-        self.flags = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT
-        data = (GLubyte * size)()
-        glBufferStorage(GL_ARRAY_BUFFER, size, data, self.flags)
+        initial = (GLubyte * size)()
+        glBufferStorage(GL_ARRAY_BUFFER, size, initial, self.flags)
+        self._map_buffer()
 
-        # size is the allocator size * attribute.stride
-        number = size // attribute.element_size
-        ptr = ctypes.POINTER(attribute.c_type * number)
-        self.data = ctypes.cast(glMapBufferRange(GL_ARRAY_BUFFER, 0, size, self.flags), ptr).contents
+    def _map_buffer(self) -> None:
+        self.data = self._map_bound_buffer(self.size)
+        self.data_ptr = ctypes.addressof(self.data)
+
+    def _map_bound_buffer(self, size: int):
+        # maps the buffer currently bound to GL_ARRAY_BUFFER; raises
+        # ValueError (NULL pointer) if mapping failed
+        number = size // ctypes.sizeof(self.c_type)
+        ptr_type = ctypes.POINTER(self.c_type * number)
+        return ctypes.cast(glMapBufferRange(GL_ARRAY_BUFFER, 0, size, self.flags), ptr_type).contents
 
     def set_data(self, data: Sequence[int] | CTypesPointer) -> None:
         raise NotImplementedError("Not yet implemented")
@@ -397,47 +555,86 @@ class PersistentBufferObject(AbstractBuffer):
     def unmap(self) -> None:
         raise NotImplementedError("PersistentBufferObjects cannot be unmapped.")
 
+    def commit(self) -> None:
+        """No-op: writes through the coherent mapping need no upload step."""
+
     def delete(self) -> None:
+        glBindBuffer(GL_ARRAY_BUFFER, self.id)
+        glUnmapBuffer(GL_ARRAY_BUFFER)
         glDeleteBuffers(1, GLuint(self.id))
         self.id = None
 
-    @lru_cache(maxsize=None)
-    def get_region(self, start, count):
-        byte_start = self.attribute_stride * start  # byte offset
-        array_count = self.attribute_count * count  # number of values
+    def __del__(self) -> None:
+        if self.id is not None:
+            try:
+                self._context.delete_buffer(self.id)
+                self.id = None
+            except (AttributeError, ImportError):
+                pass  # Interpreter is shutting down
 
-        ptr_type = ctypes.POINTER(self.attribute_ctype * array_count)
-        return ctypes.cast(ctypes.addressof(self.data) + byte_start, ptr_type).contents
+    @lru_cache(maxsize=None)  # noqa: B019
+    def get_region(self, start, count):
+        byte_start = self.stride * start  # byte offset
+        array_count = self.count * count  # number of values
+        ptr_type = ctypes.POINTER(self.c_type * array_count)
+        return ctypes.cast(self.data_ptr + byte_start, ptr_type).contents
 
     def set_region(self, start, count, data):
-        array_start = self.attribute_count * start
-        array_end = self.attribute_count * count + array_start
+        # wait for any draw still reading this memory before writing over it
+        fence = self.fence
+        if fence is not None and fence.sync is not None:
+            fence.wait()
+
+        array_start = self.count * start
+        array_end = self.count * count + array_start
         self.data[array_start:array_end] = data
 
     def resize(self, size):
-        # Create temporary copy of current data
+        # The GPU may still be executing draws that read the old buffer;
+        # deleting is safe (GL defers destruction), but wait on the fence so
+        # the copy below observes settled memory.
+        fence = self.fence
+        if fence is not None and fence.sync is not None:
+            fence.wait()
+
+        # Create a temporary system-memory copy of the current data
         temp = (GLubyte * size)()
         ctypes.memmove(temp, self.data, min(size, self.size))
-        glDeleteBuffers(1, GLuint(self.id))
 
-        # Generate new buffer
+        # Create and map the NEW buffer first: if allocation or mapping
+        # fails, the old buffer/mapping stays fully intact and the raised
+        # error leaves this object in a consistent state.
         buffer_id = GLuint()
         glGenBuffers(1, buffer_id)
-        self.id = buffer_id.value
+        new_id = buffer_id.value
+        try:
+            glBindBuffer(GL_ARRAY_BUFFER, new_id)
+            glBufferStorage(GL_ARRAY_BUFFER, size, temp, self.flags)
+            new_data = self._map_bound_buffer(size)
+        except Exception:
+            glDeleteBuffers(1, GLuint(new_id))
+            glBindBuffer(GL_ARRAY_BUFFER, self.id)
+            raise
 
-        # Link attributes to new buffer:
-        self.vao.bind()
-        self.bind()
-        self.attribute.enable()
-        self.attribute.set_pointer(self.ptr)
+        # Success: retire the old mapping and buffer
+        glBindBuffer(GL_ARRAY_BUFFER, self.id)
+        glUnmapBuffer(GL_ARRAY_BUFFER)
+        glDeleteBuffers(1, GLuint(self.id))
 
-        # Initialize the new buffer with the old data, and map it:
-        glBufferStorage(GL_ARRAY_BUFFER, size, temp, self.flags)
-
-        ptr_type = self.attribute.c_type * (size // self.attribute.element_size)
-        self.data = self.map_range(0, size, ctypes.POINTER(ptr_type), self.flags)
-
+        self.id = new_id
         self.size = size
+        self.data = new_data
+        self.data_ptr = ctypes.addressof(new_data)
+
+        # Re-point the vertex attribute at the new buffer
+        self.vao.bind()
+        glBindBuffer(GL_ARRAY_BUFFER, new_id)
+        self.attribute.enable()
+        self.attribute.set_pointer(0)
+        if self.attribute.instance:
+            self.attribute.set_divisor()
+        self.vao.unbind()
+
         self.get_region.cache_clear()
 
     def sub_data(self):

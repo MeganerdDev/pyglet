@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from typing import Any, Callable, ItemsView, Sized
 
 #: The release version
-version = '2.1.15'
+version = '2.1.16'
 __version__ = version
 
 MIN_PYTHON_VERSION = 3, 8
@@ -120,6 +120,17 @@ class Options:
     debug_x11: bool = False
     """If ``True``, prints information related to Linux X11 calls. This can potentially help narrow down driver or
     operating system issues."""
+
+    persistent_vertex_buffers: bool = True
+    """If ``True`` (the default), vertex domains back their attribute buffers
+     with persistently mapped OpenGL buffers (``glBufferStorage`` +
+     ``GL_MAP_PERSISTENT_BIT``) when the context supports them (OpenGL 4.4+,
+     or the ``GL_ARB_buffer_storage`` extension). Attribute writes then go
+     directly to GPU-visible memory, eliminating the per-frame commit/upload
+     step entirely; a per-domain fence protects writes against draws still
+     in flight. On contexts without support (e.g. macOS at GL 4.1), pyglet
+     falls back to the system-memory backed buffers automatically. Set to
+     ``False`` to always use backed buffers."""
 
     shadow_window: bool = True
     """By default, pyglet creates a hidden window with a GL context when

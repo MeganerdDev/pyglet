@@ -47,8 +47,14 @@ from pyglet.gl.gl import (
     glMultiDrawArrays,
     glMultiDrawElements,
 )
+import pyglet
 from pyglet.graphics import allocation, shader, vertexarray
-from pyglet.graphics.vertexbuffer import AttributeBufferObject, IndexedBufferObject
+from pyglet.graphics.vertexbuffer import (
+    AttributeBufferObject,
+    DrawFence,
+    IndexedBufferObject,
+    PersistentBufferObject,
+)
 
 CTypesDataType = Type[_SimpleCData]
 CTypesPointer = _Pointer
@@ -94,16 +100,71 @@ _gl_types = {
 }
 
 
-def _make_attribute_property(name: str) -> property:
+def _persistent_buffers_supported() -> bool:
+    """Whether persistently mapped vertex buffers can be used on this context."""
+    if not getattr(pyglet.options, 'persistent_vertex_buffers', True):
+        return False
+    from pyglet.gl import gl_info
+    if not gl_info.have_context():
+        return False
+    return gl_info.have_version(4, 4) or gl_info.have_extension('GL_ARB_buffer_storage')
+
+
+def _make_persistent_attribute_property(name: str, buffer: PersistentBufferObject,  # noqa: ARG001
+                                        fence: DrawFence) -> property:
+    # Persistent mapping: writes land directly in GPU-visible memory, so no
+    # dirty tracking is needed. The fence guards the first write after a draw
+    # against the GPU still reading the mapped memory.
+    get_region = buffer.get_region
+    set_region = buffer.set_region
+
     def _attribute_getter(self: VertexList) -> Array[float | int]:
-        buffer = self.domain.attrib_name_buffers[name]
-        region = buffer.get_region(self.start, self.count)
-        buffer.invalidate_region(self.start, self.count)
+        if fence.sync is not None:
+            fence.wait()
+        return get_region(self.start, self.count)
+
+    def _attribute_setter(self: VertexList, data: Any) -> None:
+        set_region(self.start, self.count, data)
+
+    return property(_attribute_getter, _attribute_setter)
+
+
+def _make_attribute_property(name: str, buffer: AttributeBufferObject) -> property:  # noqa: ARG001
+    # NOTE: the buffer is captured directly instead of looked up through
+    #       self.domain on every access: this is the hottest path in pyglet
+    #       for sprite/shape/text heavy applications (every attribute write
+    #       goes through the getter). VertexList.migrate reassigns the
+    #       instance __class__ so migrated lists bind to the new domain's
+    #       buffers. The buffer object itself is stable for the domain's
+    #       lifetime (resize mutates it in place).
+    get_region = buffer.get_region
+    set_region = buffer.set_region
+    stride = buffer.stride
+    max_spans = buffer._max_spans  # noqa: SLF001
+
+    def _attribute_getter(self: VertexList) -> Array[float | int]:
+        start = self.start
+        count = self.count
+        region = get_region(start, count)
+        # inline of buffer.invalidate_region (saves a call per write)
+        if count > 0:
+            byte_start = stride * start
+            byte_end = byte_start + stride * count
+            if byte_start < buffer._dirty_min:  # noqa: SLF001
+                buffer._dirty_min = byte_start  # noqa: SLF001
+            if byte_end > buffer._dirty_max:  # noqa: SLF001
+                buffer._dirty_max = byte_end  # noqa: SLF001
+            buffer._dirty = True  # noqa: SLF001
+            spans = buffer._dirty_spans  # noqa: SLF001
+            if spans is not None:
+                if len(spans) < max_spans:
+                    spans.add((byte_start, byte_end))
+                else:
+                    buffer._dirty_spans = None  # noqa: SLF001
         return region
 
     def _attribute_setter(self: VertexList, data: Any) -> None:
-        buffer = self.domain.attrib_name_buffers[name]
-        buffer.set_region(self.start, self.count, data)
+        set_region(self.start, self.count, data)
 
     return property(_attribute_getter, _attribute_setter)
 
@@ -177,6 +238,8 @@ class VertexList:
 
         self.domain.allocator.dealloc(self.start, self.count)
         self.domain = domain
+        # rebind attribute properties to the new domain's buffers
+        self.__class__ = domain._vertexlist_class  # noqa: SLF001
         self.start = new_start
         self.instanced = True
 
@@ -202,19 +265,20 @@ class VertexList:
 
         self.domain.allocator.dealloc(self.start, self.count)
         self.domain = domain
+        # rebind attribute properties to the new domain's buffers
+        self.__class__ = domain._vertexlist_class  # noqa: SLF001
         self.start = new_start
 
     def set_attribute_data(self, name: str, data: Any) -> None:
         buffer = self.domain.attrib_name_buffers[name]
         count = self.count
-
-        array_start = buffer.count * self.start
-        array_end = buffer.count * count + array_start
         try:
-            buffer.data[array_start:array_end] = data
-            buffer.invalidate_region(self.start, count)
+            # set_region marks dirty state (backed buffers) or waits on the
+            # draw fence (persistently mapped buffers) as appropriate
+            buffer.set_region(self.start, count, data)
         except ValueError:
-            msg = f"Invalid data size for '{name}'. Expected {array_end - array_start}, got {len(data)}."
+            expected = buffer.count * count
+            msg = f"Invalid data size for '{name}'. Expected {expected}, got {len(data)}."
             raise ValueError(msg) from None
 
     def add_instance(self, **kwargs: Any) -> VertexInstance:
@@ -379,6 +443,16 @@ class VertexDomain:
     _initial_count: int = 16
     _vertex_class: type[VertexList] = VertexList
 
+    # draw-array cache, rebuilt only when the allocator map changes
+    _draw_cache_version: int = -1
+    _draw_primcount: int = 0
+    _draw_starts_gl = None
+    _draw_sizes_gl = None
+
+    # persistent-mapping support: instanced subclasses opt out
+    _allow_persistent: bool = True
+    _fence: DrawFence | None = None
+
     def __init__(self, attribute_meta: dict[str, dict[str, Any]]) -> None:  # noqa: D107
         self.attribute_meta = attribute_meta
         self.allocator = allocation.Allocator(self._initial_count)
@@ -389,6 +463,15 @@ class VertexDomain:
         self.attrib_name_buffers = {}  # dict of AttributeName: AttributeBufferObject (for VertexLists)
 
         self._property_dict = {}  # name: property(_getter, _setter)
+
+        # Persistently mapped buffers eliminate the commit/upload step, but
+        # require GL 4.4 (or ARB_buffer_storage) and are not wired up for
+        # instanced domains. Falls back to backed buffers when unavailable.
+        use_persistent = (self._allow_persistent
+                          and not any(meta['instance'] for meta in attribute_meta.values())
+                          and _persistent_buffers_supported())
+        if use_persistent:
+            self._fence = DrawFence()
 
         for name, meta in attribute_meta.items():
             assert meta['format'][0] in _gl_types, f"'{meta['format']}' is not a valid attribute format for '{name}'."
@@ -402,15 +485,30 @@ class VertexDomain:
                                                                       instanced)
 
             # Create buffer:
-            self.attrib_name_buffers[name] = buffer = AttributeBufferObject(attribute.stride * self.allocator.capacity,
-                                                                            attribute)
-            # TODO: use persistent buffer if we have GL support for it:
-            # attribute.buffer = PersistentBufferObject(attribute.stride * self.allocator.capacity, attribute, self.vao)
+            buffer = None
+            if use_persistent:
+                try:
+                    buffer = PersistentBufferObject(attribute.stride * self.allocator.capacity, attribute, self.vao)
+                    buffer.fence = self._fence
+                    self._property_dict[attribute.name] = _make_persistent_attribute_property(
+                        name, buffer, self._fence)
+                except Exception:  # noqa: BLE001
+                    # capability probe passed but creation failed (driver
+                    # quirk): fall back to backed buffers from here on
+                    use_persistent = False
+                    buffer = None
 
+            if buffer is None:
+                buffer = AttributeBufferObject(attribute.stride * self.allocator.capacity, attribute)
+                self._property_dict[attribute.name] = _make_attribute_property(name, buffer)
+
+            self.attrib_name_buffers[name] = buffer
             self.buffer_attributes.append((buffer, attribute))
 
-            # Create custom property to be used in the VertexList:
-            self._property_dict[attribute.name] = _make_attribute_property(name)
+        # drop the fence if the persistent fallback left no persistent buffers
+        if self._fence is not None and not any(
+                isinstance(b, PersistentBufferObject) for b, _ in self.buffer_attributes):
+            self._fence = None
 
         # Make a custom VertexList class w/ properties for each attribute in the ShaderProgram:
         self._vertexlist_class = type(self._vertex_class.__name__, (self._vertex_class,), self._property_dict)
@@ -473,17 +571,33 @@ class VertexDomain:
         for buffer, _ in self.buffer_attributes:
             buffer.commit()
 
-        starts, sizes = self.allocator.get_allocated_regions()
-        primcount = len(starts)
+        # rebuild the draw arrays only when allocations changed; with a
+        # stable scene this is pure cache-hit every frame
+        allocator = self.allocator
+        if self._draw_cache_version != allocator.version:
+            starts, sizes = allocator.get_allocated_regions()
+            primcount = len(starts)
+            self._draw_primcount = primcount
+            if primcount > 1:
+                self._draw_starts_gl = (GLint * primcount)(*starts)
+                self._draw_sizes_gl = (GLsizei * primcount)(*sizes)
+            elif primcount == 1:
+                self._draw_starts_gl = starts[0]
+                self._draw_sizes_gl = sizes[0]
+            self._draw_cache_version = allocator.version
+
+        primcount = self._draw_primcount
         if primcount == 0:
             pass
         elif primcount == 1:
             # Common case
-            glDrawArrays(mode, starts[0], sizes[0])
+            glDrawArrays(mode, self._draw_starts_gl, self._draw_sizes_gl)
         else:
-            starts = (GLint * primcount)(*starts)
-            sizes = (GLsizei * primcount)(*sizes)
-            glMultiDrawArrays(mode, starts, sizes, primcount)
+            glMultiDrawArrays(mode, self._draw_starts_gl, self._draw_sizes_gl, primcount)
+
+        fence = self._fence
+        if fence is not None:
+            fence.arm()
 
     def draw_subset(self, mode: int, vertex_list: VertexList) -> None:
         """Draw a specific VertexList in the domain.
@@ -503,6 +617,10 @@ class VertexDomain:
             buffer.commit()
 
         glDrawArrays(mode, vertex_list.start, vertex_list.count)
+
+        fence = self._fence
+        if fence is not None:
+            fence.arm()
 
     @property
     def is_empty(self) -> bool:
@@ -539,6 +657,7 @@ def _make_restricted_instance_attribute_property(name: str) -> property:
 
 
 class InstancedVertexDomain(VertexDomain):  # noqa: D101
+    _allow_persistent = False  # persistent mapping is not wired for instancing
     instance_allocator: Allocator
     _instances: int
     _instance_properties: dict[str, property]
@@ -719,19 +838,35 @@ class IndexedVertexDomain(VertexDomain):
 
         self.index_buffer.commit()
 
-        starts, sizes = self.index_allocator.get_allocated_regions()
-        primcount = len(starts)
+        # rebuild the draw arrays only when index allocations changed; the
+        # pointer/size ctypes arrays for glMultiDrawElements are expensive
+        # to construct per frame on fragmented domains
+        allocator = self.index_allocator
+        if self._draw_cache_version != allocator.version:
+            starts, sizes = allocator.get_allocated_regions()
+            primcount = len(starts)
+            self._draw_primcount = primcount
+            if primcount > 1:
+                starts = [s * self.index_element_size + self.index_buffer.ptr for s in starts]
+                self._draw_starts_gl = (ctypes.POINTER(GLvoid) * primcount)(*(GLintptr * primcount)(*starts))
+                self._draw_sizes_gl = (GLsizei * primcount)(*sizes)
+            elif primcount == 1:
+                self._draw_starts_gl = self.index_buffer.ptr + starts[0] * self.index_element_size
+                self._draw_sizes_gl = sizes[0]
+            self._draw_cache_version = allocator.version
+
+        primcount = self._draw_primcount
         if primcount == 0:
             pass
         elif primcount == 1:
             # Common case
-            glDrawElements(mode, sizes[0], self.index_gl_type,
-                           self.index_buffer.ptr + starts[0] * self.index_element_size)
+            glDrawElements(mode, self._draw_sizes_gl, self.index_gl_type, self._draw_starts_gl)
         else:
-            starts = [s * self.index_element_size + self.index_buffer.ptr for s in starts]
-            starts = (ctypes.POINTER(GLvoid) * primcount)(*(GLintptr * primcount)(*starts))
-            sizes = (GLsizei * primcount)(*sizes)
-            glMultiDrawElements(mode, sizes, self.index_gl_type, starts, primcount)
+            glMultiDrawElements(mode, self._draw_sizes_gl, self.index_gl_type, self._draw_starts_gl, primcount)
+
+        fence = self._fence
+        if fence is not None:
+            fence.arm()
 
     def draw_subset(self, mode: int, vertex_list: IndexedVertexList) -> None:
         """Draw a specific IndexedVertexList in the domain.
@@ -754,6 +889,10 @@ class IndexedVertexDomain(VertexDomain):
         glDrawElements(mode, vertex_list.index_count, self.index_gl_type,
                        self.index_buffer.ptr +
                        vertex_list.index_start * self.index_element_size)
+
+        fence = self._fence
+        if fence is not None:
+            fence.arm()
 
 
 class InstancedIndexedVertexDomain(IndexedVertexDomain, InstancedVertexDomain):
