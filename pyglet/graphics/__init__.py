@@ -438,13 +438,22 @@ class Batch:
 
         domain_map = self.group_map[group]
 
+        # Build a hashable key from the attribute metadata. A flat tuple is
+        # several times cheaper than str(attributes), and this runs for every
+        # vertex list creation and migration.
+        attributes_key = tuple(
+            (name, meta.get('type'), meta.get('size'), meta.get('location'),
+             meta.get('count'), meta.get('format'), meta.get('instance'))
+            for name, meta in attributes.items()
+        )
+
         # If instanced, ensure a separate domain, as multiple instance sources can match the key.
         if instanced:
             self._instance_count += 1
-            key = (indexed, self._instance_count, mode, str(attributes))
+            key = (indexed, self._instance_count, mode, attributes_key)
         else:
             # Find domain given formats, indices and mode
-            key = (indexed, 0, mode, str(attributes))
+            key = (indexed, 0, mode, attributes_key)
 
         try:
             domain = domain_map[key]

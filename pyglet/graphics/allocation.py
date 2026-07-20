@@ -55,12 +55,18 @@ class Allocator:
     """Buffer space allocation implementation."""
     sizes: list[int]
     starts: list[int]
+    version: int
 
-    __slots__ = 'capacity', 'starts', 'sizes'
+    __slots__ = 'capacity', 'starts', 'sizes', 'version'
 
     def __init__(self, capacity: int) -> None:
         """Create an allocator for a buffer of the specified maximum capacity size."""
         self.capacity = capacity
+
+        # Incremented on every mutation of the allocation map. Consumers
+        # (e.g. VertexDomain.draw) use this to cache derived draw arrays
+        # instead of rebuilding them every frame.
+        self.version = 0
 
         # Allocated blocks.  Start index and size in parallel lists.
         #
@@ -87,6 +93,7 @@ class Allocator:
         The capacity cannot be reduced.
         """
         assert size > self.capacity
+        self.version += 1
         self.capacity = size
 
     def alloc(self, size: int) -> int:
@@ -106,6 +113,8 @@ class Allocator:
 
         if size == 0:
             return 0
+
+        self.version += 1
 
         # Return start, or raise AllocatorMemoryException
         if not self.starts:
@@ -172,6 +181,8 @@ class Allocator:
             Starting index of the re-allocated region.
         """
         assert size >= 0 and new_size >= 0  # noqa: PT018
+
+        self.version += 1
 
         if new_size == 0:
             if size != 0:
@@ -251,6 +262,8 @@ class Allocator:
 
         if size == 0:
             return
+
+        self.version += 1
 
         assert self.starts
 

@@ -121,6 +121,17 @@ class Options:
     """If ``True``, prints information related to Linux X11 calls. This can potentially help narrow down driver or
     operating system issues."""
 
+    persistent_vertex_buffers: bool = True
+    """If ``True`` (the default), vertex domains back their attribute buffers
+     with persistently mapped OpenGL buffers (``glBufferStorage`` +
+     ``GL_MAP_PERSISTENT_BIT``) when the context supports them (OpenGL 4.4+,
+     or the ``GL_ARB_buffer_storage`` extension). Attribute writes then go
+     directly to GPU-visible memory, eliminating the per-frame commit/upload
+     step entirely; a per-domain fence protects writes against draws still
+     in flight. On contexts without support (e.g. macOS at GL 4.1), pyglet
+     falls back to the system-memory backed buffers automatically. Set to
+     ``False`` to always use backed buffers."""
+
     shadow_window: bool = True
     """By default, pyglet creates a hidden window with a GL context when
      pyglet.gl is imported.  This allows resources to be loaded before
