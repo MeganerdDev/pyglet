@@ -493,6 +493,11 @@ class Batch:
                 # Remove unused domains from batch
                 if domain.is_empty:
                     del domain_map[(indexed, instanced, mode, formats)]
+                    # free GL resources deterministically: domains hold a
+                    # dynamically created class (a reference cycle), so
+                    # without this their buffers -- persistent mappings
+                    # included -- linger until a full cyclic gc pass
+                    domain.delete()
                     continue
                 draw_list.append((lambda d, m: lambda: d.draw(m))(domain, mode))  # noqa: PLC3002
 

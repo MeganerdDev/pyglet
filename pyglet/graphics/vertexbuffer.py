@@ -11,7 +11,6 @@ from __future__ import annotations
 import abc
 import ctypes
 import sys
-from functools import lru_cache
 from typing import TYPE_CHECKING, Sequence, Type
 
 from _ctypes import Array, _Pointer, _SimpleCData
@@ -270,6 +269,7 @@ class BackedBufferObject(BufferObject):
         self._dirty_max = 0
         self._dirty = False
         self._dirty_spans = set()  # None means overflowed: use min..max span
+        self._regions = {}         # (start, count) -> ctypes view
 
         self.stride = stride
         self.count = count
@@ -332,12 +332,19 @@ class BackedBufferObject(BufferObject):
             self._dirty = False
             self._dirty_spans = set()
 
-    @lru_cache(maxsize=None)  # noqa: B019
     def get_region(self, start: int, count: int) -> Array[CTypesDataType]:
-        byte_start = self.stride * start  # byte offset
-        array_count = self.count * count  # number of values
-        ptr_type = ctypes.POINTER(self.c_type * array_count)
-        return ctypes.cast(self.data_ptr + byte_start, ptr_type).contents
+        # per-instance cache (not lru_cache): a class-level cache keyed on
+        # (self, start, count) pins every buffer ever cached, keeping dead
+        # domains' buffers (and their persistent mappings) alive forever
+        try:
+            return self._regions[(start, count)]
+        except KeyError:
+            byte_start = self.stride * start  # byte offset
+            array_count = self.count * count  # number of values
+            ptr_type = ctypes.POINTER(self.c_type * array_count)
+            region = ctypes.cast(self.data_ptr + byte_start, ptr_type).contents
+            self._regions[(start, count)] = region
+            return region
 
     def get_region_for_write(self, start: int, count: int) -> Array[CTypesDataType]:
         """Get a region view intended for the caller to write into.
@@ -403,7 +410,7 @@ class BackedBufferObject(BufferObject):
         self._dirty = True
         self._dirty_spans = None
 
-        self.get_region.cache_clear()
+        self._regions.clear()
 
     def invalidate(self) -> None:
         super().invalidate()
@@ -449,37 +456,43 @@ class IndexedBufferObject(BackedBufferObject):
 
 
 class DrawFence:
-    """A GL fence guarding persistently mapped buffers against in-flight draws.
+    """Guards persistently mapped buffers against draws still in flight.
 
-    A vertex domain using persistently mapped buffers arms this fence right
-    after issuing its draw commands. The first CPU write to any of the
-    domain's buffers afterwards waits for the fence, guaranteeing the GPU has
-    finished reading the mapped memory before it is modified. The wait is a
-    no-op in the common case (the previous frame has long finished by the
-    time the next update writes).
+    A vertex domain using persistently mapped buffers arms this after issuing
+    its draw commands. The first CPU write to any of the domain's buffers
+    afterwards waits, guaranteeing the GPU has finished reading the mapped
+    memory before it is modified.
+
+    Arming is just a flag: the actual GL sync object is created lazily inside
+    :py:meth:`wait`. Because GL commands execute in submission order, a fence
+    inserted at wait time still signals only after every previously issued
+    draw has completed, so the guarantee is identical, while domains that are
+    drawn but never written between draws (static scenery, idle text) create
+    no sync objects at all. This also means an armed fence holds no GL object
+    that could leak when its domain is discarded.
     """
 
-    __slots__ = ('sync',)
+    __slots__ = ('armed',)
 
-    # wait in 16.7ms slices, give up (and proceed) after ~1 second
+    # wait in 16.7ms slices, give up (and proceed) after ~150ms
     _WAIT_SLICE_NS = 16_666_666
-    _MAX_WAIT_SLICES = 60
+    _MAX_WAIT_SLICES = 9
 
     def __init__(self) -> None:
-        self.sync = None
+        self.armed = False
 
     def arm(self) -> None:
-        """Insert a fence after the draw commands just issued."""
-        if self.sync is not None:
-            glDeleteSync(self.sync)
-        self.sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+        """Mark that draw commands reading the mapped buffers were issued."""
+        self.armed = True
 
     def wait(self) -> None:
-        """Block until the armed fence has signaled, then clear it."""
-        sync = self.sync
-        if sync is None:
+        """Block until all previously issued GL commands completed."""
+        if not self.armed:
             return
-        self.sync = None
+        self.armed = False
+        # inserted after the draws in the command stream, so waiting on it
+        # waits for them; typically already signaled by the time we get here
+        sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
         try:
             # first wait flushes the command stream so the fence is
             # guaranteed to eventually signal
@@ -534,6 +547,7 @@ class PersistentBufferObject(AbstractBuffer):
         self.vao = vao
 
         self._context = pyglet.gl.current_context
+        self._regions = {}  # (start, count) -> ctypes view
 
         # GL_MAP_READ_BIT keeps reads through the mapping defined behavior:
         # resize, VertexList.migrate and user code all read attribute regions.
@@ -597,12 +611,17 @@ class PersistentBufferObject(AbstractBuffer):
             except (AttributeError, ImportError):
                 pass  # Interpreter is shutting down
 
-    @lru_cache(maxsize=None)  # noqa: B019
     def get_region(self, start, count):
-        byte_start = self.stride * start  # byte offset
-        array_count = self.count * count  # number of values
-        ptr_type = ctypes.POINTER(self.c_type * array_count)
-        return ctypes.cast(self.data_ptr + byte_start, ptr_type).contents
+        # per-instance cache: see BackedBufferObject.get_region
+        try:
+            return self._regions[(start, count)]
+        except KeyError:
+            byte_start = self.stride * start  # byte offset
+            array_count = self.count * count  # number of values
+            ptr_type = ctypes.POINTER(self.c_type * array_count)
+            region = ctypes.cast(self.data_ptr + byte_start, ptr_type).contents
+            self._regions[(start, count)] = region
+            return region
 
     def get_region_for_write(self, start, count):
         """Get a region view intended for the caller to write into.
@@ -612,14 +631,14 @@ class PersistentBufferObject(AbstractBuffer):
         handing out a writable view.
         """
         fence = self.fence
-        if fence is not None and fence.sync is not None:
+        if fence is not None and fence.armed:
             fence.wait()
         return self.get_region(start, count)
 
     def set_region(self, start, count, data):
         # wait for any draw still reading this memory before writing over it
         fence = self.fence
-        if fence is not None and fence.sync is not None:
+        if fence is not None and fence.armed:
             fence.wait()
 
         array_start = self.count * start
@@ -631,7 +650,7 @@ class PersistentBufferObject(AbstractBuffer):
         # deleting is safe (GL defers destruction), but wait on the fence so
         # the copy below observes settled memory.
         fence = self.fence
-        if fence is not None and fence.sync is not None:
+        if fence is not None and fence.armed:
             fence.wait()
 
         # Create a temporary system-memory copy of the current data
@@ -672,7 +691,7 @@ class PersistentBufferObject(AbstractBuffer):
             self.attribute.set_divisor()
         self.vao.unbind()
 
-        self.get_region.cache_clear()
+        self._regions.clear()
 
     def sub_data(self):
         # Not necessary with persistent mapping

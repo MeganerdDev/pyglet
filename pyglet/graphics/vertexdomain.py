@@ -578,6 +578,27 @@ class VertexDomain:
     def is_empty(self) -> bool:
         return not self.allocator.starts
 
+    def delete(self) -> None:
+        """Release this domain's GL resources (buffers and VAO).
+
+        Called by the Batch when an emptied domain is discarded. Without
+        this, teardown depends on the cyclic garbage collector (every domain
+        creates a dynamic VertexList class, which is a reference cycle), so
+        applications with tuned or frozen gc accumulate dead domains' GL
+        buffers -- including persistent mappings -- indefinitely.
+        """
+        for buffer, _ in self.buffer_attributes:
+            try:
+                buffer.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        self.buffer_attributes.clear()
+        self.attrib_name_buffers.clear()
+        try:
+            self.vao.delete()
+        except Exception:  # noqa: BLE001
+            pass
+
     def __repr__(self) -> str:
         return f'<{self.__class__.__name__}@{id(self):x} {self.allocator}>'
 
@@ -758,6 +779,14 @@ class IndexedVertexDomain(VertexDomain):
             self.index_buffer.resize(capacity * self.index_element_size)
             self.index_allocator.set_capacity(capacity)
             return self.index_allocator.realloc(start, count, new_count)
+
+    def delete(self) -> None:
+        """Release GL resources including the index buffer."""
+        super().delete()
+        try:
+            self.index_buffer.delete()
+        except Exception:  # noqa: BLE001
+            pass
 
     def create(self, count: int, index_count: int) -> IndexedVertexList:
         """Create an :py:class:`IndexedVertexList` in this domain.
